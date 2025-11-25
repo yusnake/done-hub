@@ -104,13 +104,25 @@ func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Req
 		headers["Accept"] = "text/event-stream"
 	}
 
-	// 只在用户没有自定义 anthropic-beta 时才设置默认值
-	if _, exists := headers["anthropic-beta"]; !exists {
-		if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-5-sonnet") {
-			headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15"
-		} else if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-7-sonnet") {
-			headers["anthropic-beta"] = "output-128k-2025-02-19"
+	// 透传模式下跳过 anthropic-beta 自动添加
+	if !p.IsPassthrough() {
+		// 只在用户没有自定义 anthropic-beta 时才设置默认值
+		if _, exists := headers["anthropic-beta"]; !exists {
+			if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-5-sonnet") {
+				headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15"
+			} else if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-7-sonnet") {
+				headers["anthropic-beta"] = "output-128k-2025-02-19"
+			}
 		}
+	}
+
+	// 透传模式下跳过额外参数处理，直接创建请求
+	if p.IsPassthrough() {
+		req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(claudeRequest), p.Requester.WithHeader(headers))
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+		}
+		return req, nil
 	}
 
 	// 使用BaseProvider的统一方法创建请求，支持额外参数处理

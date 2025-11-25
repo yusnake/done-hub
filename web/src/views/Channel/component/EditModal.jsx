@@ -1946,6 +1946,50 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                       id="helper-tex-compatible_response-label">{customizeT(inputPrompt.compatible_response)}</FormHelperText>
                   </FormControl>
                 )}
+
+                {/* Anthropic Claude 透传模式开关 */}
+                {values.type === 14 && (
+                  <FormControl fullWidth>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          disabled={hasTag}
+                          checked={(() => {
+                            try {
+                              const other = JSON.parse(values.other || '{}')
+                              return Boolean(other.passthrough)
+                            } catch {
+                              return false
+                            }
+                          })()}
+                          onChange={(event) => {
+                            try {
+                              const other = JSON.parse(values.other || '{}')
+                              if (event.target.checked) {
+                                other.passthrough = true
+                              } else {
+                                delete other.passthrough
+                              }
+                              const newValue = Object.keys(other).length > 0 ? JSON.stringify(other) : ''
+                              setFieldValue('other', newValue)
+                            } catch {
+                              if (event.target.checked) {
+                                setFieldValue('other', '{"passthrough":true}')
+                              } else {
+                                setFieldValue('other', '')
+                              }
+                            }
+                          }}
+                        />
+                      }
+                      label="透传模式"
+                    />
+                    <FormHelperText>
+                      启用后将透传所有客户端请求头到 Claude API（跳过 hop-by-hop 头），适用于需要完整转发原始请求的场景
+                    </FormHelperText>
+                  </FormControl>
+                )}
+
                 {pluginList[values.type] &&
                   Object.keys(pluginList[values.type]).map((pluginId) => {
                     const plugin = pluginList[values.type][pluginId]

@@ -30,6 +30,8 @@ var AllowChannelType = []int{config.ChannelTypeAnthropic, config.ChannelTypeVert
 type relayClaudeOnly struct {
 	relayBase
 	claudeRequest *claude.ClaudeRequest
+	rawBodyBytes  []byte // 透传模式下保存原始请求体
+	isPassthrough bool   // 是否透传模式
 }
 
 func NewRelayClaudeOnly(c *gin.Context) *relayClaudeOnly {
@@ -45,15 +47,26 @@ func NewRelayClaudeOnly(c *gin.Context) *relayClaudeOnly {
 }
 
 func (r *relayClaudeOnly) setRequest() error {
-	r.claudeRequest = &claude.ClaudeRequest{}
-	if err := common.UnmarshalBodyReusable(r.c, r.claudeRequest); err != nil {
+	// 首先读取原始请求体（用于透传模式）
+	rawBody, err := io.ReadAll(r.c.Request.Body)
+	if err != nil {
 		return err
 	}
+	r.c.Request.Body.Close()
+	r.rawBodyBytes = rawBody
+
+	// 解析到结构体以提取 model 和 stream 字段
+	r.claudeRequest = &claude.ClaudeRequest{}
+	if err := json.Unmarshal(rawBody, r.claudeRequest); err != nil {
+		return err
+	}
+
+	// 重新设置 body 以便后续使用
+	r.c.Request.Body = io.NopCloser(strings.NewReader(string(rawBody)))
+
 	r.setOriginalModel(r.claudeRequest.Model)
 	// 设置原始模型到 Context，用于统一请求响应模型功能
 	r.c.Set("original_model", r.claudeRequest.Model)
-
-	// 保持原始的流式/非流式状态
 
 	return nil
 }
@@ -98,6 +111,14 @@ func (r *relayClaudeOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 		done = true
 		return
+	}
+
+	// 检查是否启用透传模式（仅限 Anthropic Claude 渠道）
+	if channelType == config.ChannelTypeAnthropic {
+		if passthroughProvider, ok := r.provider.(claude.ClaudePassthroughInterface); ok && passthroughProvider.IsPassthrough() {
+			r.isPassthrough = true
+			return r.sendPassthrough(passthroughProvider)
+		}
 	}
 
 	r.claudeRequest.Model = r.modelName
@@ -146,6 +167,99 @@ func (r *relayClaudeOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		done = true
 	}
 	return
+}
+
+// sendPassthrough 真正的透传模式，直接转发原始请求和响应
+func (r *relayClaudeOnly) sendPassthrough(provider claude.ClaudePassthroughInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+	// 准备透传的请求体（可能需要修改 model 字段）
+	bodyBytes := r.rawBodyBytes
+
+	// 如果有模型映射，只修改 model 字段
+	if r.modelName != r.claudeRequest.Model {
+		var bodyMap map[string]interface{}
+		if jsonErr := json.Unmarshal(r.rawBodyBytes, &bodyMap); jsonErr == nil {
+			bodyMap["model"] = r.modelName
+			if newBody, jsonErr := json.Marshal(bodyMap); jsonErr == nil {
+				bodyBytes = newBody
+			}
+		}
+	}
+
+	if r.heartbeat != nil {
+		r.heartbeat.Stop()
+	}
+
+	// 调用透传方法
+	resp, err := provider.SendPassthroughRequest(bodyBytes, r.claudeRequest.Stream)
+	if err != nil {
+		done = true
+		return
+	}
+	defer resp.Body.Close()
+
+	// 复制上游响应头到客户端（跳过 hop-by-hop 头）
+	for key, values := range resp.Header {
+		lowerKey := strings.ToLower(key)
+		// 跳过 hop-by-hop 头
+		if lowerKey == "connection" ||
+			lowerKey == "keep-alive" ||
+			lowerKey == "transfer-encoding" ||
+			lowerKey == "te" ||
+			lowerKey == "trailer" ||
+			lowerKey == "upgrade" ||
+			lowerKey == "content-length" { // content-length 由 gin 自动处理
+			continue
+		}
+		for _, value := range values {
+			r.c.Writer.Header().Add(key, value)
+		}
+	}
+
+	// 直接转发响应
+	if r.claudeRequest.Stream {
+		// 流式响应
+		r.c.Writer.Header().Set("Content-Type", "text/event-stream")
+		r.c.Writer.Header().Set("Cache-Control", "no-cache")
+		r.c.Writer.Header().Set("Connection", "keep-alive")
+		r.c.Writer.WriteHeader(resp.StatusCode)
+
+		flusher, ok := r.c.Writer.(http.Flusher)
+		if !ok {
+			err = common.StringErrorWrapperLocal("streaming not supported", "stream_error", http.StatusInternalServerError)
+			done = true
+			return
+		}
+
+		// 使用 bufio.Scanner 逐行读取并转发
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 增大缓冲区
+		isFirst := true
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if isFirst {
+				r.SetFirstResponseTime(time.Now())
+				isFirst = false
+			}
+
+			// 直接转发每一行
+			fmt.Fprintf(r.c.Writer, "%s\n", line)
+			flusher.Flush()
+		}
+
+		if scanErr := scanner.Err(); scanErr != nil {
+			logger.SysError(fmt.Sprintf("[Passthrough] Stream scan error: %v", scanErr))
+		}
+	} else {
+		// 非流式响应
+		r.c.Writer.WriteHeader(resp.StatusCode)
+		_, copyErr := io.Copy(r.c.Writer, resp.Body)
+		if copyErr != nil {
+			logger.SysError(fmt.Sprintf("[Passthrough] Response copy error: %v", copyErr))
+		}
+	}
+
+	return nil, false
 }
 
 func (r *relayClaudeOnly) GetError(err *types.OpenAIErrorWithStatusCode) (int, any) {
